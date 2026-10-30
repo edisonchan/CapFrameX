@@ -355,6 +355,234 @@ namespace CapFrameX.Test.Data
             Assert.AreEqual(0, run.CaptureData.LayerIndex.Length);
         }
 
+        // --- FrameView sensor import ---
+        //
+        // FrameView logs sensors once per frame. The import resamples them onto CapFrameX's own
+        // 250 ms sensor grid (SensorLoggingRefreshPeriod), fills BetweenMeasureTime (required for
+        // run aggregation), maps the GPU power columns, and flips the sign of the battery discharge
+        // rate.
+        //
+        // NOTE: no real FrameView capture with an active battery discharge (negative drain rate) was
+        // available when these tests were written. The discharge-sign convention follows the
+        // maintainer's stated FrameView behavior (negative on discharge); it is validated
+        // structurally here, not against a discharging sample file.
+
+        [TestMethod]
+        public void ConvertPresentData_FrameViewSensors_ResampleTo250msGridAndFillBetweenMeasureTime()
+        {
+            var lines = BuildFrameViewLines(frameCount: 40);
+
+            var run = _recordManager.ConvertPresentDataLinesToSessionRun(lines);
+            var sensorData = run.SensorData2;
+
+            var measureTimes = sensorData.MeasureTime.Values.ToArray();
+            Assert.IsTrue(measureTimes.Length >= 2, "expected a 250 ms grid with at least two points");
+
+            // MeasureTime sits on a uniform 250 ms grid.
+            for (int i = 1; i < measureTimes.Length; i++)
+                Assert.AreEqual(0.25, measureTimes[i] - measureTimes[i - 1], 1E-9,
+                    $"MeasureTime step at index {i} should be 250 ms");
+
+            // BetweenMeasureTime is filled (first delta 0, then 250 ms). Without it run
+            // aggregation ends up with an empty sensor report.
+            var between = sensorData.BetweenMeasureTime.Values.ToArray();
+            Assert.AreEqual(measureTimes.Length, between.Length);
+            Assert.AreEqual(0.0, between[0], 1E-9);
+            for (int i = 1; i < between.Length; i++)
+                Assert.AreEqual(0.25, between[i], 1E-9);
+
+            // AMD board power maps to the GPU Power metric.
+            Assert.IsTrue(sensorData.ContainsKey("amdpwr(w)(api)"));
+            var amdPower = sensorData["amdpwr(w)(api)"].Values.ToArray();
+            Assert.IsTrue(amdPower.All(v => !double.IsNaN(v)));
+            Assert.AreEqual(200.0, amdPower.Average(), 1E-6);
+
+            // Battery discharge rate is flipped to a positive value (FrameView reports it negative)
+            // and keeps the "Discharge Rate" name of the native sensor.
+            Assert.IsTrue(sensorData.ContainsKey("batterydrainrate(w)"));
+            Assert.AreEqual("Discharge Rate", sensorData["batterydrainrate(w)"].Name);
+            var drain = sensorData["batterydrainrate(w)"].Values.ToArray();
+            Assert.IsTrue(drain.All(v => v > 0 || double.IsNaN(v)),
+                "battery drain rate must be positive after the sign flip");
+
+            // A column that is entirely NA is dropped, not stored as a zero series.
+            Assert.IsFalse(sensorData.ContainsKey("gpu1clk(mhz)"),
+                "an all-NA sensor column must be skipped, not added as a zero series");
+        }
+
+        [TestMethod]
+        public void ConvertPresentData_FrameViewSensors_GapWithoutSamplesStaysNaN()
+        {
+            // A sensor dropout inside the log must stay a hole. The resampler interpolates across
+            // a gap and extends the outer samples, so without the mask those bins would report a
+            // value that was never measured.
+            var lines = new List<string>
+            {
+                "Application,ProcessID,SwapChainAddress,TimeInSeconds,MsBetweenPresents,GPU0Clk (MHz)"
+            };
+            for (int i = 0; i < 40; i++)
+            {
+                // Frames 15..29 cover the second 250 ms bin (0.25 s .. 0.5 s) completely.
+                string clock = i >= 15 && i <= 29 ? "NA" : "1500";
+                lines.Add($"Game,1,A,{i * 0.0167:0.000},16.7,{clock}");
+            }
+
+            var run = _recordManager.ConvertPresentDataLinesToSessionRun(lines);
+            var clockValues = run.SensorData2["gpu0clk(mhz)"].Values.ToArray();
+
+            Assert.AreEqual(3, clockValues.Length);
+            Assert.AreEqual(1500.0, clockValues[0], 1E-6);
+            Assert.IsTrue(double.IsNaN(clockValues[1]),
+                "a bin without a single sample must stay NaN instead of being interpolated");
+            Assert.AreEqual(1500.0, clockValues[2], 1E-6);
+        }
+
+        [TestMethod]
+        public void ConvertPresentData_FrameViewSensors_AggregatesTwoRunsViaBetweenMeasureTime()
+        {
+            var run1 = _recordManager.ConvertPresentDataLinesToSessionRun(BuildFrameViewLines(frameCount: 40));
+            var run2 = _recordManager.ConvertPresentDataLinesToSessionRun(BuildFrameViewLines(frameCount: 40));
+
+            // Aggregating two runs rebuilds MeasureTime from BetweenMeasureTime: the path that
+            // failed before BetweenMeasureTime was filled on import.
+            _recordManager.NormalizeStartTimesOfSessionRuns(new List<ISessionRun> { run1, run2 });
+
+            var run1Measure = run1.SensorData2.MeasureTime.Values.ToArray();
+            var run2Measure = run2.SensorData2.MeasureTime.Values.ToArray();
+
+            // Each run's MeasureTime is rebuilt from its own BetweenMeasureTime (starts at 0).
+            Assert.AreEqual(0.0, run1Measure[0], 1E-9);
+            // The second run is concatenated after the first on the shared timeline.
+            Assert.AreEqual(run1Measure[run1Measure.Length - 1], run2Measure[0], 1E-9);
+
+            Assert.AreEqual(run1.SensorData2.BetweenMeasureTime.Values.Count, run1Measure.Length);
+            Assert.AreEqual(run2.SensorData2.BetweenMeasureTime.Values.Count, run2Measure.Length);
+        }
+
+        [TestMethod]
+        public void ConvertPresentData_PcatPower_WinsOverApiGpuPower()
+        {
+            // PCAT is an actual measurement, so it must feed the "GPU Power" metric even when the
+            // driver also reports board power. FrameView writes the PCAT columns ahead of the API
+            // ones, and the metric takes the first match, so PCAT wins by column order.
+            var lines = new List<string>
+            {
+                "Application,ProcessID,SwapChainAddress,TimeInSeconds,MsBetweenPresents," +
+                "PCAT Power Total(W),NV Pwr(W) (API)"
+            };
+            for (int i = 0; i < 40; i++)
+                lines.Add($"Game,1,A,{i * 0.0167:0.000},16.7,300.0,250.0");
+
+            var run = _recordManager.ConvertPresentDataLinesToSessionRun(lines);
+            var sensorData = run.SensorData2;
+
+            var power = sensorData.Values
+                .FirstOrDefault(c => c.Name.Contains("GPU Power") && c.Type == "Power");
+            Assert.IsNotNull(power);
+            Assert.AreEqual("GPU Power (PCAT)", power.Name);
+
+            var gpuPower = sensorData.GpuPower;
+            Assert.IsTrue(gpuPower.Length > 0);
+            Assert.AreEqual(300, gpuPower.Average(), 1E-6,
+                "GPU Power must come from PCAT, not from the NV Pwr API value");
+        }
+
+        // End-to-end check against a real, trimmed FrameView 2.0 capture (AMD Ryzen 7 9850X3D +
+        // RTX 5060 Ti, an NVIDIA-based system), kept at 150 frames. This exercises the genuine
+        // header layout ("GPU0Clk (MHz)", "NV Pwr(W) (API)", "CPU Package Power(W)"), genuine NA
+        // cells, and the run-aggregation path - things the inline synthetic cases above cannot
+        // guarantee.
+        [TestMethod]
+        public void ConvertPresentData_AmdRyzenFixture_ResamplesRealFormatAndMapsGpuPower()
+        {
+            var lines = new List<string>(
+                File.ReadAllLines(@"TestRecordFiles\FrameView_AmdRyzen9850X3D_Trimmed.csv"));
+
+            var run = _recordManager.ConvertPresentDataLinesToSessionRun(lines);
+            var sensorData = run.SensorData2;
+
+            // MeasureTime sits on a uniform 250 ms grid.
+            var measureTimes = sensorData.MeasureTime.Values.ToArray();
+            Assert.IsTrue(measureTimes.Length >= 2, "expected a 250 ms grid with at least two points");
+            for (int i = 1; i < measureTimes.Length; i++)
+                Assert.AreEqual(0.25, measureTimes[i] - measureTimes[i - 1], 1E-6,
+                    $"MeasureTime step at index {i} should be 250 ms");
+
+            // BetweenMeasureTime is filled (first delta 0, then 250 ms each) so run aggregation
+            // no longer produces an empty sensor report.
+            var between = sensorData.BetweenMeasureTime.Values.ToArray();
+            Assert.AreEqual(measureTimes.Length, between.Length);
+            Assert.AreEqual(0.0, between[0], 1E-9);
+            for (int i = 1; i < between.Length; i++)
+                Assert.AreEqual(0.25, between[i], 1E-6);
+
+            // On this NVIDIA system the GPU power is reported via "NV Pwr(W) (API)" and must map
+            // to the "GPU Power" metric (real per-frame values, not synthetic). The "AMDPwr(W) (API)"
+            // column is present in the header but all-NA, so it is dropped rather than stored.
+            Assert.IsTrue(sensorData.ContainsKey("nvpwr(w)(api)"), "NV board power must map to GPU Power");
+            var nvPower = sensorData["nvpwr(w)(api)"].Values.ToArray();
+            Assert.IsTrue(nvPower.Length > 0);
+            Assert.IsTrue(nvPower.All(v => !double.IsNaN(v)), "NV power must not be NaN after resampling");
+
+            // The all-NA AMDPwr column must be skipped, not added as a zero series.
+            Assert.IsFalse(sensorData.ContainsKey("amdpwr(w)(api)"),
+                "an all-NA sensor column must be skipped, not added as a zero series");
+
+            // x86: CPU Package Power is the CPU power source.
+            Assert.IsTrue(sensorData.ContainsKey("cpupackagepower(w)"));
+
+            // GPU1 columns are all-NA in this single-GPU capture, so they must be dropped,
+            // not stored as a zero series.
+            Assert.IsFalse(sensorData.ContainsKey("gpu1clk(mhz)"),
+                "an all-NA sensor column must be skipped, not added as a zero series");
+        }
+
+        // Real RTX SPARK (N1X) capture that begins with a 16-line "//" comment block (added by
+        // external tooling, not FrameView). The skip mirrors LoadSessionFromCSV's comment handling
+        // before the converter runs.
+        [TestMethod]
+        public void ConvertPresentData_RtxSparkFixture_SkipsCommentBlock()
+        {
+            var rawLines = File.ReadAllLines(@"TestRecordFiles\FrameView_RtxSparkN1X_Trimmed.csv");
+            Assert.IsTrue(rawLines[0].StartsWith(FileRecordInfo.HEADER_MARKER),
+                "fixture must begin with a comment block to exercise the skip path");
+
+            var lines = rawLines
+                .SkipWhile(line => line.Contains(FileRecordInfo.HEADER_MARKER))
+                .ToList();
+            var run = _recordManager.ConvertPresentDataLinesToSessionRun(lines);
+            Assert.IsNotNull(run);
+            var sensorData = run.SensorData2;
+
+            // Comment block skipped: sensors are parsed from the real header that follows it.
+            Assert.IsTrue(sensorData.ContainsKey("gpu0clk(mhz)"),
+                "GPU0 clock must be parsed after skipping the comment block");
+            Assert.IsTrue(sensorData.MeasureTime.Values.Count >= 1,
+                "MeasureTime must be populated from the data rows");
+
+            // RTX SPARK keeps E/P-Core power as separate sensors (not merged).
+            Assert.IsTrue(sensorData.ContainsKey("e-corepower(w)"));
+            Assert.IsTrue(sensorData.ContainsKey("p-corepower(w)"));
+        }
+
+        private static List<string> BuildFrameViewLines(int frameCount)
+        {
+            var lines = new List<string>
+            {
+                "Application,ProcessID,SwapChainAddress,TimeInSeconds,MsBetweenPresents," +
+                "GPU0Clk (MHz),GPU0Util (%),AMDPwr (W) (API),Battery Drain Rate (W),GPU1Clk (MHz)"
+            };
+
+            for (int i = 0; i < frameCount; i++)
+            {
+                double t = i * 0.0167;
+                // GPU1Clk is always NA -> exercises the all-NA column drop path.
+                lines.Add($"Game,1,A,{t:0.000},16.7,1500,50,200.0,{-(12.0 + i * 0.1):0.0},NA");
+            }
+
+            return lines;
+        }
+
         private string CreateSessionFile(string fileName, string processName)
         {
             string path = Path.Combine(_testDirectory, fileName);

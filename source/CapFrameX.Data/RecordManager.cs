@@ -10,6 +10,7 @@ using CapFrameX.Data.Session.Converters;
 using CapFrameX.EventAggregation.Messages;
 using CapFrameX.Extensions;
 using CapFrameX.Extensions.NetStandard;
+using CapFrameX.PMD;
 using CapFrameX.PresentMonInterface;
 using CapFrameX.Statistics.NetStandard;
 using Microsoft.Extensions.Logging;
@@ -1639,6 +1640,28 @@ namespace CapFrameX.Data
                     indexCPUStartQPCTime, indexCPUStartQPCTimeInMs, indexLayerIndex, indexPresentId);
                 var values = new string[metrics.Length];
 
+                // Sampled hardware sensor columns embedded in the CSV (NVIDIA FrameView logs).
+                // Unrecognized files simply end up with an empty list here.
+                var sensorColumns = FrameViewSensorColumnMapper.MapColumns(metrics);
+                double[][] embeddedSensorValues = null;
+                if (sensorColumns.Count > 0)
+                {
+                    foreach (var sensorColumn in sensorColumns)
+                    {
+                        // Make the CSV parser materialize these columns as well
+                        if (sensorColumn.ColumnIndex >= 0 && sensorColumn.ColumnIndex < requiredColumns.Length)
+                            requiredColumns[sensorColumn.ColumnIndex] = true;
+                    }
+
+                    embeddedSensorValues = new double[sensorColumns.Count][];
+                    for (int i = 0; i < sensorColumns.Count; i++)
+                    {
+                        // Pre-fill with NaN so "NA" values and empty lines stay aligned
+                        // with the measure times.
+                        embeddedSensorValues[i] = Enumerable.Repeat(double.NaN, presentLineCount).ToArray();
+                    }
+                }
+
                 for (int lineIndex = 0; lineIndex < dataLines.Count; lineIndex++)
                 {
                     string line = dataLines[lineIndex];
@@ -1802,6 +1825,22 @@ namespace CapFrameX.Data
                             captureData.LayerIndex[lineIndex] = layerIndex;
                         }
                     }
+                    if (embeddedSensorValues != null)
+                    {
+                        for (int i = 0; i < sensorColumns.Count; i++)
+                        {
+                            // Unparsable values ("NA" in unsupported metrics, empty cells) stay NaN
+                            if (double.TryParse(GetStringFromArray(values, sensorColumns[i].ColumnIndex), NumberStyles.Any, CultureInfo.InvariantCulture, out var embeddedSensorValue))
+                            {
+                                // FrameView reports battery discharge as a negative rate; the
+                                // LibreHardwareMonitor "Discharge Rate" sensor CapFrameX uses shows it
+                                // positive, so flip the sign on import.
+                                if (sensorColumns[i].Name == "Discharge Rate")
+                                    embeddedSensorValue = -embeddedSensorValue;
+                                embeddedSensorValues[i][lineIndex] = embeddedSensorValue;
+                            }
+                        }
+                    }
                 }
 
                 // No frame on a known layer: spare composed and older captures a -1 per frame.
@@ -1834,9 +1873,46 @@ namespace CapFrameX.Data
                         .ToArray();
                 }
 
+                // FrameView logs sensors per frame; put them onto CapFrameX's own 250 ms sensor-logging
+                // grid (SensorLoggingRefreshPeriod) with the shared time-weighted resampler. This keeps
+                // the sensor resolution close to live captures and provides a constant BetweenMeasureTime
+                // that the run aggregation relies on.
+                double[] sensorMeasureTimes = captureData.TimeInSeconds;
+                if (sensorColumns.Count > 0 && embeddedSensorValues != null)
+                {
+                    const double sensorGridStep = 0.25; // 250 ms, matches the SensorLoggingRefreshPeriod setting
+                    var gridded = ResampleSensorsToGrid(embeddedSensorValues, sensorMeasureTimes, sensorGridStep);
+                    embeddedSensorValues = gridded.GriddedValues;
+                    sensorMeasureTimes = gridded.GriddedTimes;
+                }
+
                 // Take over sensor data from CSV file
                 sessionRun.SensorData2 = new SessionSensorData2(initialAdd: true);
-                captureData.TimeInSeconds.ForEach(time => sessionRun.SensorData2["MeasureTime"].Values.AddLast(time));
+                foreach (var time in sensorMeasureTimes)
+                {
+                    sessionRun.SensorData2["MeasureTime"].Values.AddLast(time);
+                }
+
+                // BetweenMeasureTime: per-sample delta, matching the live capture
+                // (SessionSensorDataLive.AddMeasureTime). Required for run aggregation; without it the
+                // sensor report ends up empty and the aggregation throws.
+                {
+                    var measureTimes = sessionRun.SensorData2.MeasureTime.Values;
+                    var betweenMeasureTimes = sessionRun.SensorData2.BetweenMeasureTime.Values;
+                    double previousMeasureTime = 0;
+                    foreach (var measureTime in measureTimes)
+                    {
+                        betweenMeasureTimes.AddLast(measureTime - previousMeasureTime);
+                        previousMeasureTime = measureTime;
+                    }
+                }
+
+                // Take over sampled hardware sensor data embedded in the CSV file
+                // (e.g. NVIDIA FrameView logs)
+                if (sensorColumns.Count > 0)
+                {
+                    AddEmbeddedSensorData(sessionRun.SensorData2, sensorColumns, embeddedSensorValues);
+                }
 
                 sessionRun.CaptureData = captureData;
                 return sessionRun;
@@ -1847,6 +1923,138 @@ namespace CapFrameX.Data
                 throw;
             }
         }
+
+        /// <summary>
+        /// Adds the sampled hardware sensor columns of an imported CSV file (e.g. NVIDIA FrameView
+        /// logs) to the session sensor data. Columns that never reported a value (e.g. PCAT power
+        /// without a PCAT setup) are skipped.
+        /// </summary>
+        private static void AddEmbeddedSensorData(ISessionSensorData2 sensorData,
+            List<FrameViewSensorColumnMapper.SensorColumn> sensorColumns, double[][] sensorValues)
+        {
+            for (int i = 0; i < sensorColumns.Count; i++)
+            {
+                var values = sensorValues[i];
+
+                bool hasValues = false;
+                for (int j = 0; j < values.Length; j++)
+                {
+                    if (!double.IsNaN(values[j]))
+                    {
+                        hasValues = true;
+                        break;
+                    }
+                }
+
+                if (!hasValues)
+                    continue;
+
+                var sensorEntry = new SessionSensorEntry(sensorColumns[i].Name, sensorColumns[i].Type);
+                foreach (var value in values)
+                {
+                    sensorEntry.Values.AddLast(value);
+                }
+
+                sensorData.Add(sensorColumns[i].Key, sensorEntry);
+            }
+        }
+
+        /// <summary>
+        /// Resamples per-frame embedded sensor series onto a uniform time grid. FrameView logs sensor
+        /// samples once per frame, which is finer than the 250 ms SensorLoggingRefreshPeriod polling
+        /// interval, so the values are put on that grid to match a live capture and to yield a
+        /// constant BetweenMeasureTime. The resampling itself is done by
+        /// <see cref="PmdTimeSeriesResampler"/>, the time-weighted resampler this project already uses
+        /// for PMD (Powenetics, BENCHLAB) power samples: samples are unevenly spaced here in exactly
+        /// the same way, so they are weighted by their span instead of counting equally per bin.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="PmdTimeSeriesResampler"/> has no notion of missing samples, so NaN cells ("NA")
+        /// are dropped before the call. Dropping alone is not enough: the resampler extends the first
+        /// and last sample without limit and interpolates across a gap, which would turn a sensor
+        /// dropout into plausible looking data. A bin that held no sample at all is therefore masked
+        /// back to NaN, the way <c>SessionSensorDataLive</c> logs a cycle without a reading.
+        /// A column without any value keeps a NaN series and is dropped by
+        /// <see cref="AddEmbeddedSensorData"/>.
+        /// </remarks>
+        private static (double[] GriddedTimes, double[][] GriddedValues) ResampleSensorsToGrid(
+            double[][] sensorValues, double[] times, double step)
+        {
+            int frameCount = times.Length;
+            if (frameCount == 0 || sensorValues.Length == 0)
+                return (Array.Empty<double>(), sensorValues);
+
+            double startTime = times[0];
+            double endTime = times[frameCount - 1];
+            int binCount = (int)Math.Floor((endTime - startTime) / step) + 1;
+            if (binCount < 1)
+                binCount = 1;
+
+            var griddedTimes = new double[binCount];
+            for (int b = 0; b < binCount; b++)
+                griddedTimes[b] = startTime + b * step;
+
+            var griddedValues = new double[sensorValues.Length][];
+            var sampleTimes = new List<double>(frameCount);
+            var sampleValues = new List<float>(frameCount);
+            var sampledBins = new bool[binCount];
+
+            for (int s = 0; s < sensorValues.Length; s++)
+            {
+                var source = sensorValues[s];
+                int count = Math.Min(frameCount, source.Length);
+
+                sampleTimes.Clear();
+                sampleValues.Clear();
+                Array.Clear(sampledBins, 0, binCount);
+
+                for (int i = 0; i < count; i++)
+                {
+                    if (double.IsNaN(source[i]))
+                        continue;
+
+                    sampleTimes.Add(times[i]);
+                    sampleValues.Add((float)source[i]);
+                    sampledBins[GetSampleBin(times[i], startTime, step, binCount)] = true;
+                }
+
+                griddedValues[s] = ResampleSeries(
+                    sampleTimes, sampleValues, startTime, step, binCount, sampledBins);
+            }
+
+            return (griddedTimes, griddedValues);
+        }
+
+        /// <summary>
+        /// Resamples one sensor series onto the grid, keeping the bins without a sample empty.
+        /// </summary>
+        private static double[] ResampleSeries(List<double> sampleTimes, List<float> sampleValues,
+            double startTime, double step, int binCount, bool[] sampledBins)
+        {
+            if (sampleTimes.Count == 0)
+                return EmptySeries(binCount);
+
+            var resampled = PmdTimeSeriesResampler.Resample(sampleTimes, sampleValues, startTime, step, binCount);
+            if (resampled.Length != binCount)
+                return EmptySeries(binCount);
+
+            var values = new double[binCount];
+            for (int b = 0; b < binCount; b++)
+                values[b] = sampledBins[b] ? resampled[b] : double.NaN;
+
+            return values;
+        }
+
+        private static int GetSampleBin(double time, double startTime, double step, int binCount)
+        {
+            int bin = (int)Math.Floor((time - startTime) / step);
+            if (bin < 0)
+                return 0;
+            return bin >= binCount ? binCount - 1 : bin;
+        }
+
+        private static double[] EmptySeries(int length)
+            => Enumerable.Repeat(double.NaN, length).ToArray();
 
         /// <summary>
         /// Filters present data lines to include only the dominant process and its dominant SwapChainAddress.
