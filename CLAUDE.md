@@ -863,6 +863,27 @@ multiples of it) instead of by packet count; a bin's `TimeStamp` is its start. `
 the "Sample Rate" display show the raw device packet rate. Unit tests: `CapFrameX.Test/PMD/PmdTimingTest`
 simulates the measured device including the batched delivery.
 
+## FrameView sensor import
+
+FrameView logs carry hardware sensor columns and repeat the latest reading in every frame row (on an
+RTX 5090 with a Core Ultra 9 285K: the GPU values about every 0.5 s, the CPU power about every 0.2 s).
+`FrameViewSensorColumnMapper` (`CapFrameX.Data`) maps them by normalized header onto LibreHardwareMonitor
+names ("GPU Core", "CPU Total", "CPU Package", "Charge Level", "Discharge Rate", ...);
+`ConvertPresentDataLinesToSessionRun` puts them onto 250 ms cells from the first frame
+(`RecordManager.EmbeddedSensorInterval`) with `PmdTimeSeriesResampler`, each measured in its middle,
+and fills `BetweenMeasureTime` (the first interval is the gap to the first frame), which aggregation and
+cut need for a time axis. A cell without a reading stays NaN: the mask uses the same spans as the
+resampler's cells. PCAT is added ahead of the driver power (`IsMeasurement`), so `GpuPower` takes it
+whatever the column order. Of several GPUs only the one with the highest mean load is named "GPU Core" and
+"GPU Memory" (`SelectPrimaryGpu`), the others "GPU1 Core", ..., which the analysis does not read. The
+drain rate is negated into the positive "Discharge Rate". E-core and P-core power are imported but never
+count as CPU power. A CSV without sensor columns (PresentMon, and every live capture, whose rows take the
+same path) keeps the per-frame MeasureTime and no BetweenMeasureTime. Aggregated runs are chained by their
+intervals like native captures, so each seam can move the next run by up to half an interval and a frame
+against its frames. Tests: `FrameViewSensorColumnMapperTest`, `RecordManagerCacheTest`
+(`ConvertPresentData_*`) and `Integration/FrameViewSensorImportTest`, which follows a complete
+S.T.A.L.K.E.R. 2 log through analysis, sensor tab, FPS/W, save, aggregation and cut.
+
 ## Text field styles
 
 `CapFrameX.View/Styles/CxTextFields.xaml` (merged in `App.xaml`) replaces MDIX's implicit `TextBox`
