@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -33,7 +35,23 @@ namespace CapFrameX.Data
 
             /// <summary>Sensor type (e.g. "Load", "Clock", "Temperature", "Power").</summary>
             public string Type { get; set; }
+
+            /// <summary>Index of the GPU a GPU#... column reports, -1 for every other column.</summary>
+            public int GpuIndex { get; set; } = -1;
+
+            /// <summary>The part of the GPU a GPU#... column reports ("Core" or "Memory"), null for
+            /// every other column.</summary>
+            public string GpuPart { get; set; }
+
+            /// <summary>Factor every value of the column is multiplied with on import.</summary>
+            public double Factor { get; set; } = 1;
+
+            /// <summary>True for a measured value (PCAT), which is added ahead of the driver values
+            /// of the same name, so the analysis takes it whatever the column order.</summary>
+            public bool IsMeasurement { get; set; }
         }
+
+        private sealed record SensorDefinition(string Name, string Type, double Factor = 1, bool IsMeasurement = false);
 
         // GPU#Clk (MHz), GPU#MemClock (MHz), GPU#Util (%), GPU#Temp (C) - [# = GPU index]
         private static readonly Regex GpuSensorColumnRegex = new Regex(
@@ -41,41 +59,42 @@ namespace CapFrameX.Data
             RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
         // Fixed sensor columns. Keys are normalized header names (see NormalizeHeader).
-        private static readonly Dictionary<string, (string Name, string Type)> SensorColumns =
-            new Dictionary<string, (string Name, string Type)>(StringComparer.Ordinal)
+        private static readonly Dictionary<string, SensorDefinition> SensorColumns =
+            new Dictionary<string, SensorDefinition>(StringComparer.Ordinal)
             {
                 // GPU power. PCAT is an actual measurement, so it is named to match the "GPU Power"
-                // lookup too; FrameView writes it ahead of the API values, so the analysis picks it
-                // up first and it wins over the board power the driver reports.
-                ["pcatpowertotal(w)"] = ("GPU Power (PCAT)", "Power"),
-                ["nvpwr(w)(api)"] = ("GPU Power", "Power"),
-                ["nv-total-usbcpwr(w)(api)"] = ("GPU Board Power (excl. USB-C)", "Power"),
-                ["gpuonlypwr(w)(api)"] = ("GPU Chip Power", "Power"),
-                ["amdpwr(w)(api)"] = ("GPU Power", "Power"),
+                // lookup too and wins over the board power the driver reports.
+                ["pcatpowertotal(w)"] = new("GPU Power (PCAT)", "Power", IsMeasurement: true),
+                ["nvpwr(w)(api)"] = new("GPU Power", "Power"),
+                ["nv-total-usbcpwr(w)(api)"] = new("GPU Board Power (excl. USB-C)", "Power"),
+                ["gpuonlypwr(w)(api)"] = new("GPU Chip Power", "Power"),
+                ["amdpwr(w)(api)"] = new("GPU Power", "Power"),
 
                 // Per the FrameView user guide (1.2/1.4), "CPUClk" is the average CPU
                 // frequency - not the per-core maximum CapFrameX names "CPU Max".
-                ["cpuclk(mhz)"] = ("CPU Average", "Clock"),
-                ["cpuutil(%)"] = ("CPU Total", "Load"),
-                ["cpuutil%"] = ("CPU Total", "Load"),
-                ["cpupackagetemp(c)"] = ("CPU Package", "Temperature"),
-                ["cputemp(c)"] = ("CPU Package", "Temperature"),
-                ["cpupackagepower(w)"] = ("CPU Package", "Power"),
-                ["cpupackagepower(watts)"] = ("CPU Package", "Power"),
+                ["cpuclk(mhz)"] = new("CPU Average", "Clock"),
+                ["cpuutil(%)"] = new("CPU Total", "Load"),
+                ["cpuutil%"] = new("CPU Total", "Load"),
+                ["cpupackagetemp(c)"] = new("CPU Package", "Temperature"),
+                ["cputemp(c)"] = new("CPU Package", "Temperature"),
+                ["cpupackagepower(w)"] = new("CPU Package", "Power"),
+                ["cpupackagepower(watts)"] = new("CPU Package", "Power"),
                 // Per-cluster core power (FrameView 1.7+): E-Core and P-Core are reported as separate
                 // sensors. No platform-specific merge is performed on import; "CPU Package Power(W)"
                 // (mapped just above) remains the CPU power source where FrameView provides it.
-                ["e-corepower(w)"] = ("E-Core Power", "Power"),
-                ["p-corepower(w)"] = ("P-Core Power", "Power"),
+                ["e-corepower(w)"] = new("E-Core Power", "Power"),
+                ["p-corepower(w)"] = new("P-Core Power", "Power"),
 
-                ["batterypercentage"] = ("Battery Charge Level", "Level"),
-                // FrameView only reports discharge, and LibreHardwareMonitor names that sensor
-                // "Discharge Rate" (Battery.cs), so the imported entry uses the same name.
-                ["batterydrainrate(w)"] = ("Discharge Rate", "Power"),
+                // LibreHardwareMonitor's battery sensors (Battery.cs) are "Charge Level" and, while
+                // discharging, "Discharge Rate" as a positive value. FrameView reports the drain rate
+                // negative while discharging, so its sign is flipped.
+                ["batterypercentage"] = new("Charge Level", "Level"),
+                ["batterydrainrate(w)"] = new("Discharge Rate", "Power", Factor: -1),
             };
 
         /// <summary>
-        /// Finds all FrameView sensor columns within a CSV header.
+        /// Finds all FrameView sensor columns within a CSV header. The GPU#... columns of the lowest
+        /// GPU index get the names the analysis reads; see <see cref="NameGpuColumns"/>.
         /// </summary>
         /// <param name="metrics">The CSV header columns.</param>
         /// <returns>The recognized sensor columns, empty if the file has no embedded sensor data.</returns>
@@ -95,47 +114,125 @@ namespace CapFrameX.Data
                     var match = GpuSensorColumnRegex.Match(normalizedHeader);
                     if (match.Success)
                     {
-                        var (name, type) = GetGpuSensorNameAndType(match.Groups[2].Value);
-                        AddSensorColumn(sensorColumns, usedKeys, normalizedHeader, columnIndex, name, type);
+                        var (part, type) = GetGpuSensorPartAndType(match.Groups[2].Value);
+                        var sensorColumn = AddSensorColumn(sensorColumns, usedKeys, normalizedHeader, columnIndex,
+                            new SensorDefinition(null, type));
+                        if (sensorColumn != null)
+                        {
+                            sensorColumn.GpuIndex = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+                            sensorColumn.GpuPart = part;
+                        }
                     }
                     else if (SensorColumns.TryGetValue(normalizedHeader, out var sensor))
                     {
-                        AddSensorColumn(sensorColumns, usedKeys, normalizedHeader, columnIndex, sensor.Name, sensor.Type);
+                        AddSensorColumn(sensorColumns, usedKeys, normalizedHeader, columnIndex, sensor);
                     }
                 }
 
                 columnIndex++;
             }
 
+            var gpuIndices = sensorColumns.Where(column => column.GpuIndex >= 0).Select(column => column.GpuIndex);
+            if (gpuIndices.Any())
+                NameGpuColumns(sensorColumns, gpuIndices.Min());
+
             return sensorColumns;
         }
 
-        private static void AddSensorColumn(List<SensorColumn> sensorColumns, HashSet<string> usedKeys,
-            string key, int columnIndex, string name, string type)
+        /// <summary>
+        /// Picks the GPU the analysis shows. FrameView logs every GPU in columns of its own, and the
+        /// analysis reads the first entry named "GPU Core", so only one GPU may carry that name. Of the
+        /// GPUs that reported a value, the one with the highest mean load wins: the GPU that rendered
+        /// the game, which on a laptop is not necessarily GPU0. Without load values the lowest index
+        /// wins, ties go to the lower index.
+        /// </summary>
+        /// <param name="sensorColumns">The sensor columns of the file.</param>
+        /// <param name="values">The values of every column, in the order of <paramref name="sensorColumns"/>;
+        /// NaN where the column had no value.</param>
+        /// <returns>The index of the primary GPU, -1 when no GPU reported a value.</returns>
+        public static int SelectPrimaryGpu(IReadOnlyList<SensorColumn> sensorColumns, IReadOnlyList<double[]> values)
+        {
+            int primaryGpu = -1;
+            double primaryLoad = double.NaN;
+
+            foreach (var gpuIndex in sensorColumns.Where(column => column.GpuIndex >= 0)
+                .Select(column => column.GpuIndex).Distinct().OrderBy(index => index))
+            {
+                bool hasValues = false;
+                double load = double.NaN;
+                for (int i = 0; i < sensorColumns.Count; i++)
+                {
+                    if (sensorColumns[i].GpuIndex != gpuIndex)
+                        continue;
+
+                    var readings = values[i].Where(double.IsFinite).ToArray();
+                    if (readings.Length == 0)
+                        continue;
+
+                    hasValues = true;
+                    if (sensorColumns[i].Type == "Load")
+                        load = readings.Average();
+                }
+
+                if (!hasValues)
+                    continue;
+
+                bool higherLoad = !double.IsNaN(load) && (double.IsNaN(primaryLoad) || load > primaryLoad);
+                if (primaryGpu < 0 || higherLoad)
+                {
+                    primaryGpu = gpuIndex;
+                    primaryLoad = load;
+                }
+            }
+
+            return primaryGpu;
+        }
+
+        /// <summary>
+        /// Names the GPU#... columns: those of the primary GPU "GPU Core" and "GPU Memory" like a native
+        /// capture, those of every other GPU "GPU1 Core", "GPU1 Memory", ..., which the analysis does
+        /// not read.
+        /// </summary>
+        public static void NameGpuColumns(IEnumerable<SensorColumn> sensorColumns, int primaryGpuIndex)
+        {
+            foreach (var sensorColumn in sensorColumns.Where(column => column.GpuIndex >= 0))
+            {
+                sensorColumn.Name = sensorColumn.GpuIndex == primaryGpuIndex
+                    ? $"GPU {sensorColumn.GpuPart}"
+                    : $"GPU{sensorColumn.GpuIndex} {sensorColumn.GpuPart}";
+            }
+        }
+
+        private static SensorColumn AddSensorColumn(List<SensorColumn> sensorColumns, HashSet<string> usedKeys,
+            string key, int columnIndex, SensorDefinition sensor)
         {
             // Duplicate keys cannot be represented as distinct session sensor entries,
             // keep the first occurrence
             if (!usedKeys.Add(key))
-                return;
+                return null;
 
-            sensorColumns.Add(new SensorColumn
+            var sensorColumn = new SensorColumn
             {
                 ColumnIndex = columnIndex,
                 Key = key,
-                Name = name,
-                Type = type
-            });
+                Name = sensor.Name,
+                Type = sensor.Type,
+                Factor = sensor.Factor,
+                IsMeasurement = sensor.IsMeasurement
+            };
+            sensorColumns.Add(sensorColumn);
+            return sensorColumn;
         }
 
-        private static (string Name, string Type) GetGpuSensorNameAndType(string kind)
+        private static (string Part, string Type) GetGpuSensorPartAndType(string kind)
         {
             switch (kind)
             {
-                case "clk": return ("GPU Core", "Clock");
+                case "clk": return ("Core", "Clock");
                 case "memclk":
-                case "memclock": return ("GPU Memory", "Clock");
-                case "util": return ("GPU Core", "Load");
-                case "temp": return ("GPU Core", "Temperature");
+                case "memclock": return ("Memory", "Clock");
+                case "util": return ("Core", "Load");
+                case "temp": return ("Core", "Temperature");
                 default: return (null, null);
             }
         }

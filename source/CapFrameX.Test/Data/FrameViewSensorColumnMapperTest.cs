@@ -60,9 +60,11 @@ namespace CapFrameX.Test.Data
             Assert.AreEqual(("GPU Core", "Load"), (byKey[5].Name, byKey[5].Type));
             Assert.AreEqual(("GPU Core", "Temperature"), (byKey[6].Name, byKey[6].Type));
             Assert.AreEqual(("GPU Power", "Power"), (byKey[7].Name, byKey[7].Type));
-            // PCAT is an actual measurement, so it is named to match the "GPU Power" lookup as well;
-            // the analysis takes the first match, which is the PCAT column here.
+            // PCAT is an actual measurement, so it is named to match the "GPU Power" lookup as well
+            // and marked as one: the import adds it first although its column comes last here.
             Assert.AreEqual(("GPU Power (PCAT)", "Power"), (byKey[8].Name, byKey[8].Type));
+            Assert.IsTrue(byKey[8].IsMeasurement);
+            Assert.IsFalse(byKey[7].IsMeasurement);
         }
 
         [TestMethod]
@@ -106,9 +108,71 @@ namespace CapFrameX.Test.Data
 
             Assert.AreEqual(2, sensorColumns.Count);
 
+            // LibreHardwareMonitor's names (Battery.cs), so native and imported records share the
+            // rows of the sensor tab; FrameView's drain rate is negative while discharging.
             var byKey = sensorColumns.ToDictionary(c => c.ColumnIndex);
-            Assert.AreEqual(("Battery Charge Level", "Level"), (byKey[1].Name, byKey[1].Type));
+            Assert.AreEqual(("Charge Level", "Level"), (byKey[1].Name, byKey[1].Type));
+            Assert.AreEqual(1, byKey[1].Factor);
             Assert.AreEqual(("Discharge Rate", "Power"), (byKey[2].Name, byKey[2].Type));
+            Assert.AreEqual(-1, byKey[2].Factor);
+        }
+
+        [TestMethod]
+        public void MapColumns_TwoGpus_OnlyTheLowestIndexIsTheGpuCore()
+        {
+            var metrics = new[] { "GPU0Clk(MHz)", "GPU0MemClk(MHz)", "GPU1Clk(MHz)", "GPU1MemClk(MHz)", "GPU1Util(%)" };
+
+            var sensorColumns = FrameViewSensorColumnMapper.MapColumns(metrics);
+
+            CollectionAssert.AreEqual(new[] { "GPU Core", "GPU Memory", "GPU1 Core", "GPU1 Memory", "GPU1 Core" },
+                sensorColumns.Select(column => column.Name).ToArray());
+            CollectionAssert.AreEqual(new[] { 0, 0, 1, 1, 1 }, sensorColumns.Select(column => column.GpuIndex).ToArray());
+        }
+
+        [TestMethod]
+        public void NameGpuColumns_RenamesEveryGpuButThePrimary()
+        {
+            var sensorColumns = FrameViewSensorColumnMapper.MapColumns(
+                new[] { "GPU0Clk(MHz)", "GPU0Util(%)", "GPU1Clk(MHz)", "GPU1Util(%)", "CPUUtil(%)" });
+
+            FrameViewSensorColumnMapper.NameGpuColumns(sensorColumns, 1);
+
+            CollectionAssert.AreEqual(new[] { "GPU0 Core", "GPU0 Core", "GPU Core", "GPU Core", "CPU Total" },
+                sensorColumns.Select(column => column.Name).ToArray());
+        }
+
+        [TestMethod]
+        [DataRow(3.0, 97.0, 1, DisplayName = "The busy GPU1 wins over the idle GPU0")]
+        [DataRow(95.0, 4.0, 0, DisplayName = "The busy GPU0 wins over the idle GPU1")]
+        [DataRow(50.0, 50.0, 0, DisplayName = "A tie goes to the lower index")]
+        [DataRow(double.NaN, 40.0, 1, DisplayName = "A GPU without values does not count")]
+        [DataRow(80.0, double.NaN, 0, DisplayName = "The only GPU with values")]
+        [DataRow(double.NaN, double.NaN, -1, DisplayName = "No GPU with values")]
+        public void SelectPrimaryGpu_TakesTheGpuWithTheHighestLoad(double gpu0Load, double gpu1Load, int expected)
+        {
+            var sensorColumns = FrameViewSensorColumnMapper.MapColumns(new[] { "GPU0Util(%)", "GPU1Util(%)" });
+            var values = new[] { Readings(gpu0Load), Readings(gpu1Load) };
+
+            Assert.AreEqual(expected, FrameViewSensorColumnMapper.SelectPrimaryGpu(sensorColumns, values));
+        }
+
+        [TestMethod]
+        public void SelectPrimaryGpu_WithoutLoadValues_TakesTheLowestIndexWithValues()
+        {
+            var sensorColumns = FrameViewSensorColumnMapper.MapColumns(new[] { "GPU0Clk(MHz)", "GPU1Clk(MHz)", "GPU2Clk(MHz)" });
+            var values = new[] { Readings(double.NaN), Readings(1500), Readings(2100) };
+
+            Assert.AreEqual(1, FrameViewSensorColumnMapper.SelectPrimaryGpu(sensorColumns, values));
+        }
+
+        [TestMethod]
+        public void SelectPrimaryGpu_ALoadValueWinsOverAGpuWithoutOne()
+        {
+            // GPU0 reports a clock but no load, GPU1 a load: the load decides.
+            var sensorColumns = FrameViewSensorColumnMapper.MapColumns(new[] { "GPU0Clk(MHz)", "GPU1Util(%)" });
+            var values = new[] { Readings(600), Readings(2) };
+
+            Assert.AreEqual(1, FrameViewSensorColumnMapper.SelectPrimaryGpu(sensorColumns, values));
         }
 
         [TestMethod]
@@ -158,6 +222,9 @@ namespace CapFrameX.Test.Data
             var column = AssertSingleSensorColumn(sensorColumns);
             Assert.AreEqual(0, column.ColumnIndex);
         }
+
+        // A series of a column; NaN stands for a column that reported nothing.
+        private static double[] Readings(double value) => Enumerable.Repeat(value, 8).ToArray();
 
         private static FrameViewSensorColumnMapper.SensorColumn AssertSingleSensorColumn(
             List<FrameViewSensorColumnMapper.SensorColumn> sensorColumns)

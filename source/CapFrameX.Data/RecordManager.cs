@@ -38,6 +38,10 @@ namespace CapFrameX.Data
         private const string IGNOREFLAGMARKER = "//Ignore=true";
         private const int SESSION_CACHE_CAPACITY = 16;
         private const int RECORD_INFO_CACHE_CAPACITY = 4096;
+        // Interval of the sensor values imported from a CSV file (FrameView logs them once per frame).
+        // Native captures log every 250 ms (SensorLoggingRefreshPeriod default), and averages, the
+        // sensor tab's aggregation, chart points and file size all depend on the rate.
+        internal const double EmbeddedSensorInterval = 0.25;
         private sealed class SessionCacheEntry
         {
             public long Length;
@@ -1832,12 +1836,7 @@ namespace CapFrameX.Data
                             // Unparsable values ("NA" in unsupported metrics, empty cells) stay NaN
                             if (double.TryParse(GetStringFromArray(values, sensorColumns[i].ColumnIndex), NumberStyles.Any, CultureInfo.InvariantCulture, out var embeddedSensorValue))
                             {
-                                // FrameView reports battery discharge as a negative rate; the
-                                // LibreHardwareMonitor "Discharge Rate" sensor CapFrameX uses shows it
-                                // positive, so flip the sign on import.
-                                if (sensorColumns[i].Name == "Discharge Rate")
-                                    embeddedSensorValue = -embeddedSensorValue;
-                                embeddedSensorValues[i][lineIndex] = embeddedSensorValue;
+                                embeddedSensorValues[i][lineIndex] = embeddedSensorValue * sensorColumns[i].Factor;
                             }
                         }
                     }
@@ -1873,45 +1872,16 @@ namespace CapFrameX.Data
                         .ToArray();
                 }
 
-                // FrameView logs sensors per frame; put them onto CapFrameX's own 250 ms sensor-logging
-                // grid (SensorLoggingRefreshPeriod) with the shared time-weighted resampler. This keeps
-                // the sensor resolution close to live captures and provides a constant BetweenMeasureTime
-                // that the run aggregation relies on.
-                double[] sensorMeasureTimes = captureData.TimeInSeconds;
-                if (sensorColumns.Count > 0 && embeddedSensorValues != null)
-                {
-                    const double sensorGridStep = 0.25; // 250 ms, matches the SensorLoggingRefreshPeriod setting
-                    var gridded = ResampleSensorsToGrid(embeddedSensorValues, sensorMeasureTimes, sensorGridStep);
-                    embeddedSensorValues = gridded.GriddedValues;
-                    sensorMeasureTimes = gridded.GriddedTimes;
-                }
-
                 // Take over sensor data from CSV file
                 sessionRun.SensorData2 = new SessionSensorData2(initialAdd: true);
-                foreach (var time in sensorMeasureTimes)
-                {
-                    sessionRun.SensorData2["MeasureTime"].Values.AddLast(time);
-                }
-
-                // BetweenMeasureTime: per-sample delta, matching the live capture
-                // (SessionSensorDataLive.AddMeasureTime). Required for run aggregation; without it the
-                // sensor report ends up empty and the aggregation throws.
-                {
-                    var measureTimes = sessionRun.SensorData2.MeasureTime.Values;
-                    var betweenMeasureTimes = sessionRun.SensorData2.BetweenMeasureTime.Values;
-                    double previousMeasureTime = 0;
-                    foreach (var measureTime in measureTimes)
-                    {
-                        betweenMeasureTimes.AddLast(measureTime - previousMeasureTime);
-                        previousMeasureTime = measureTime;
-                    }
-                }
-
-                // Take over sampled hardware sensor data embedded in the CSV file
-                // (e.g. NVIDIA FrameView logs)
                 if (sensorColumns.Count > 0)
                 {
-                    AddEmbeddedSensorData(sessionRun.SensorData2, sensorColumns, embeddedSensorValues);
+                    // Sampled hardware sensor columns (NVIDIA FrameView logs)
+                    AddEmbeddedSensorData(sessionRun.SensorData2, sensorColumns, embeddedSensorValues, captureData.TimeInSeconds);
+                }
+                else
+                {
+                    captureData.TimeInSeconds.ForEach(time => sessionRun.SensorData2["MeasureTime"].Values.AddLast(time));
                 }
 
                 sessionRun.CaptureData = captureData;
@@ -1925,28 +1895,38 @@ namespace CapFrameX.Data
         }
 
         /// <summary>
-        /// Adds the sampled hardware sensor columns of an imported CSV file (e.g. NVIDIA FrameView
-        /// logs) to the session sensor data. Columns that never reported a value (e.g. PCAT power
-        /// without a PCAT setup) are skipped.
+        /// Adds the sampled hardware sensor columns of an imported CSV file (NVIDIA FrameView logs) to
+        /// the session sensor data, resampled onto <see cref="EmbeddedSensorInterval"/>, and fills
+        /// MeasureTime and BetweenMeasureTime, from which the run aggregation rebuilds MeasureTime.
+        /// Columns that never reported a value (e.g. PCAT power without a PCAT setup) are skipped.
+        /// Measured values are added ahead of the driver values, so the first-match lookups of
+        /// <see cref="SessionSensorData2"/> (GPU Power) take them whatever the column order.
         /// </summary>
         private static void AddEmbeddedSensorData(ISessionSensorData2 sensorData,
-            List<FrameViewSensorColumnMapper.SensorColumn> sensorColumns, double[][] sensorValues)
+            List<FrameViewSensorColumnMapper.SensorColumn> sensorColumns, double[][] frameValues, double[] frameTimes)
         {
-            for (int i = 0; i < sensorColumns.Count; i++)
+            var (measureTimes, sensorValues) = ResampleSensorsToGrid(frameValues, frameTimes, EmbeddedSensorInterval);
+
+            int primaryGpu = FrameViewSensorColumnMapper.SelectPrimaryGpu(sensorColumns, sensorValues);
+            if (primaryGpu >= 0)
+                FrameViewSensorColumnMapper.NameGpuColumns(sensorColumns, primaryGpu);
+
+            // Each interval is the gap to the preceding measure time, as SessionSensorDataLive logs it,
+            // the first one the gap to the first frame. So in an aggregated record the first measure
+            // time of a run lies where the last cell of the run before ends instead of repeating its
+            // last measure time.
+            double previousMeasureTime = frameTimes.Length > 0 ? frameTimes[0] : 0;
+            foreach (var measureTime in measureTimes)
+            {
+                sensorData.MeasureTime.Values.AddLast(measureTime);
+                sensorData.BetweenMeasureTime.Values.AddLast(measureTime - previousMeasureTime);
+                previousMeasureTime = measureTime;
+            }
+
+            foreach (int i in Enumerable.Range(0, sensorColumns.Count).OrderBy(i => sensorColumns[i].IsMeasurement ? 0 : 1))
             {
                 var values = sensorValues[i];
-
-                bool hasValues = false;
-                for (int j = 0; j < values.Length; j++)
-                {
-                    if (!double.IsNaN(values[j]))
-                    {
-                        hasValues = true;
-                        break;
-                    }
-                }
-
-                if (!hasValues)
+                if (!values.Any(double.IsFinite))
                     continue;
 
                 var sensorEntry = new SessionSensorEntry(sensorColumns[i].Name, sensorColumns[i].Type);
@@ -1960,22 +1940,19 @@ namespace CapFrameX.Data
         }
 
         /// <summary>
-        /// Resamples per-frame embedded sensor series onto a uniform time grid. FrameView logs sensor
-        /// samples once per frame, which is finer than the 250 ms SensorLoggingRefreshPeriod polling
-        /// interval, so the values are put on that grid to match a live capture and to yield a
-        /// constant BetweenMeasureTime. The resampling itself is done by
-        /// <see cref="PmdTimeSeriesResampler"/>, the time-weighted resampler this project already uses
-        /// for PMD (Powenetics, BENCHLAB) power samples: samples are unevenly spaced here in exactly
-        /// the same way, so they are weighted by their span instead of counting equally per bin.
+        /// Resamples per-frame sensor series onto cells of <paramref name="step"/> that start at the
+        /// first frame: cell b covers [b·step, (b + 1)·step) after it, and its measure time is its
+        /// centre, where <see cref="PmdTimeSeriesResampler"/> centres a cell. Each value is the
+        /// time-weighted mean of the frame values within the cell, the resampling PMD power samples get:
+        /// frames are unevenly spaced, so they are weighted by their span instead of counting equally.
         /// </summary>
         /// <remarks>
         /// <see cref="PmdTimeSeriesResampler"/> has no notion of missing samples, so NaN cells ("NA")
         /// are dropped before the call. Dropping alone is not enough: the resampler extends the first
         /// and last sample without limit and interpolates across a gap, which would turn a sensor
-        /// dropout into plausible looking data. A bin that held no sample at all is therefore masked
-        /// back to NaN, the way <c>SessionSensorDataLive</c> logs a cycle without a reading.
-        /// A column without any value keeps a NaN series and is dropped by
-        /// <see cref="AddEmbeddedSensorData"/>.
+        /// dropout into plausible looking data. A cell that holds no sample is therefore masked back to
+        /// NaN, the way <c>SessionSensorDataLive</c> logs a cycle without a reading. A column without
+        /// any value keeps a NaN series.
         /// </remarks>
         private static (double[] GriddedTimes, double[][] GriddedValues) ResampleSensorsToGrid(
             double[][] sensorValues, double[] times, double step)
@@ -1992,7 +1969,7 @@ namespace CapFrameX.Data
 
             var griddedTimes = new double[binCount];
             for (int b = 0; b < binCount; b++)
-                griddedTimes[b] = startTime + b * step;
+                griddedTimes[b] = startTime + (b + 0.5) * step;
 
             var griddedValues = new double[sensorValues.Length][];
             var sampleTimes = new List<double>(frameCount);
@@ -2019,24 +1996,22 @@ namespace CapFrameX.Data
                 }
 
                 griddedValues[s] = ResampleSeries(
-                    sampleTimes, sampleValues, startTime, step, binCount, sampledBins);
+                    sampleTimes, sampleValues, griddedTimes[0], step, binCount, sampledBins);
             }
 
             return (griddedTimes, griddedValues);
         }
 
         /// <summary>
-        /// Resamples one sensor series onto the grid, keeping the bins without a sample empty.
+        /// Resamples one sensor series onto the grid, keeping the cells without a sample empty.
         /// </summary>
         private static double[] ResampleSeries(List<double> sampleTimes, List<float> sampleValues,
-            double startTime, double step, int binCount, bool[] sampledBins)
+            double gridStart, double step, int binCount, bool[] sampledBins)
         {
             if (sampleTimes.Count == 0)
                 return EmptySeries(binCount);
 
-            var resampled = PmdTimeSeriesResampler.Resample(sampleTimes, sampleValues, startTime, step, binCount);
-            if (resampled.Length != binCount)
-                return EmptySeries(binCount);
+            var resampled = PmdTimeSeriesResampler.Resample(sampleTimes, sampleValues, gridStart, step, binCount);
 
             var values = new double[binCount];
             for (int b = 0; b < binCount; b++)
@@ -2045,6 +2020,7 @@ namespace CapFrameX.Data
             return values;
         }
 
+        // The cell whose span [b·step, (b + 1)·step) after the first frame holds the time.
         private static int GetSampleBin(double time, double startTime, double step, int binCount)
         {
             int bin = (int)Math.Floor((time - startTime) / step);
